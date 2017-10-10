@@ -5,6 +5,20 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	ExpandFunctionName = "FUNCTION"
+	ExpandLineNumber   = "LINE"
+	ExpandTime         = "TIME"
+	ExpandDuration     = "DURATION"
+	ExpandSubject      = "SUBJECT"
+	ExpandMessageLevel = "LEVEL"
+	ExpandMessage      = "MESSAGE"
 )
 
 type LogLevel uint8
@@ -42,33 +56,59 @@ func (ll LogLevel) String() string {
 }
 
 type Instance struct {
-	Name   string
-	output io.Writer
-	tags   []string
-	log    *log.Logger
+	Name         string
+	Format       string
+	output       io.Writer
+	tags         []string
+	log          *log.Logger
+	needsRuntime bool
+
+	UpdateOutput        func()
+	UpdateOutputTrigger time.Ticker
 }
 
-func newInstance(name string, output io.Writer, tags ...string) *Instance {
-	return &Instance{
+func newInstance(name, format string, output io.Writer, tags ...string) *Instance {
+	i := &Instance{
 		Name:   name,
+		Format: format,
 		output: output,
 		tags:   tags,
 	}
+
+	return i.checkForRuntime()
 }
 
-func (i *Instance) initialize() *Instance {
-	i.log = log.New(os.Stdout, "", log.LstdFlags)
+func (i *Instance) checkForRuntime() *Instance {
+	if strings.Contains(i.Format, ExpandFunctionName) || strings.Contains(i.Format, ExpandLineNumber) {
+		i.needsRuntime = true
+	}
+
 	return i
 }
 
-func AddLoggerInstance(name string, output io.Writer, tags ...string) {
-	RegisterLogger <- newInstance(name, output, tags...).initialize()
+func (i *Instance) expand(format string, msg *Message) string {
+	for expand, value := range msg.values {
+		format = strings.Replace(format, expand, value, -1)
+	}
+
+	return format
+}
+
+func (i *Instance) initialize() *Instance {
+	//i.log = log.New(os.Stdout, "", log.LstdFlags)
+	i.log = log.New(i.output, "", 0)
+	return i
+}
+
+func AddLoggerInstance(name, format string, output io.Writer, tags ...string) {
+	RegisterLogger <- newInstance(name, format, output, tags...).initialize()
 }
 
 type Message struct {
 	Level    LogLevel
 	Subject  interface{}
 	Tags     []string
+	values   map[string]string
 	Format   string
 	Elements []interface{}
 }
@@ -79,19 +119,33 @@ var (
 	// NewLevel is channel that can change the log level
 	NewLevel chan LogLevel
 	level    LogLevel = Info
-	// Prefix is a channel that changes the prefix of the output
-	Prefix chan string
-	prefix string = ""
 
 	// By default there is one logging instance, and it logs to stdout.
-	gologgers []*Instance = []*Instance{newInstance("default", os.Stdout).initialize()}
+	gologgers []*Instance = []*Instance{newInstance("default", "[LEVEL] SUBJECT, MESSAGE", os.Stdout).initialize()}
 
 	RegisterLogger   chan *Instance
 	DeRegisterLogger chan string
+
+	// Register the start time
+	start = time.Now()
 )
 
 func Log(level LogLevel, subject interface{}, format string, elements ...interface{}) {
-	Sink <- Message{level, subject, nil, format, elements}
+	pc, name, line, _ := runtime.Caller(1)
+	fun := runtime.FuncForPC(pc)
+	if fun != nil {
+		name = fun.Name()
+	}
+
+	// Context specific values
+	values := map[string]string{
+		ExpandLineNumber:   strconv.Itoa(line),
+		ExpandFunctionName: name,
+		ExpandTime:         time.Now().String(),
+		ExpandDuration:     time.Now().Sub(start).String(),
+	}
+
+	Sink <- Message{level, subject, nil, values, format, elements}
 }
 
 func IsProduction(b bool) {
@@ -102,8 +156,9 @@ func IsProduction(b bool) {
 
 func init() {
 	Sink = make(chan Message, 256)
+	RegisterLogger = make(chan *Instance, 1)
+	DeRegisterLogger = make(chan string, 1)
 	NewLevel = make(chan LogLevel)
-	Prefix = make(chan string)
 
 	go func() {
 		for {
@@ -122,11 +177,6 @@ func init() {
 				gologgers = gologgers[:i]
 			case newLevel := <-NewLevel:
 				level = newLevel
-			case prfx := <-Prefix:
-				prefix = prfx
-				for _, l := range gologgers {
-					l.log = log.New(l.output, prefix, log.LstdFlags)
-				}
 			case msg := <-Sink:
 				if msg.Level < level {
 					break
@@ -149,14 +199,13 @@ func init() {
 					break
 				}
 
-				if msg.Subject != nil {
-					for _, l := range loggers {
-						l.log.Printf("[%v] %v, %v", msg.Level, msg.Subject, fmt.Sprintf(msg.Format, msg.Elements...))
-					}
-				} else {
-					for _, l := range loggers {
-						l.log.Printf("[%v] %v", msg.Level, fmt.Sprintf(msg.Format, msg.Elements...))
-					}
+				msg.values[ExpandMessage] = fmt.Sprintf(msg.Format, msg.Elements...)
+				msg.values[ExpandSubject] = fmt.Sprintf("%v", msg.Subject)
+				msg.values[ExpandMessageLevel] = msg.Level.String()
+
+				for _, l := range loggers {
+					format := l.expand(l.Format, &msg)
+					l.log.Printf(format)
 				}
 			}
 		}
