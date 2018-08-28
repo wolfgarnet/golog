@@ -55,6 +55,27 @@ func (ll LogLevel) String() string {
 	}
 }
 
+func ToLevel(s string) (LogLevel, error) {
+	switch strings.ToLower(s) {
+	case "none":
+		return None, nil
+	case "err":
+		return Error, nil
+	case "warning":
+		return Warning, nil
+	case "info":
+		return Info, nil
+	case "debug":
+		return Debug, nil
+	case "trace":
+		return Trace, nil
+	case "all":
+		return All, nil
+	default:
+		return None, fmt.Errorf("no such log level: %v", s)
+	}
+}
+
 type Instance struct {
 	Name         string
 	Format       string
